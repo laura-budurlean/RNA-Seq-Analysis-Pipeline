@@ -1,0 +1,288 @@
+#Load libraries
+
+import pandas as pd
+import os
+import random
+import time
+import numpy as np
+import warnings
+import base64  
+import json
+from pandas.api.types import CategoricalDtype
+
+# Visualization
+import plotly
+from plotly import tools
+import plotly.express as px
+import plotly.graph_objs as go
+
+import matplotlib.pyplot as plt; plt.rcdefaults()
+from matplotlib import rcParams
+
+import IPython
+from IPython.display import HTML, display, Markdown, IFrame
+
+# Data analysis
+from itertools import combinations
+import scipy.spatial.distance as dist
+import scipy.stats as ss
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import quantile_transform
+
+from rpy2 import robjects
+from rpy2.robjects import r, pandas2ri
+
+# External Code
+from utils import *
+
+from plotly.offline import init_notebook_mode
+init_notebook_mode(connected = True)
+
+%matplotlib inline
+rnaseq_data_filename = "gene_counts_file.csv"   #upload file as CSV
+meta_data_filename = "metadata.csv"             #upload file as CSV
+meta_class_column_name = "age"                  #use name from metadata file
+control_name = "control"                        #use control name from metadata file
+interactive_plot = False
+filter_genes = True
+low_expression_threshold = 0.3
+nr_genes = 2500
+gene_list_for_clustergrammer = ""
+clustering_topk = 800
+diff_gex_method = "DESeq2"
+diff_gex_plot_method = "volcano"
+pvalue_threshold = 0.05
+logfc_threshold = 1.5
+gene_topk = 500
+enrichr_libraries = ['Gene Ontology', 'Pathway']
+nr_genesets = 15
+small_molecule_method = "L1000FWD"
+l1000_topk = 500
+nr_drugs = 7
+
+warnings.filterwarnings('ignore')
+random.seed(0)
+pandas2ri.activate()
+notebook_metadata = dict()
+notebook_metadata["tables"] = dict()
+notebook_metadata["figures"] = dict()
+notebook_metadata["input_parameters"] = dict()
+if interactive_plot == True:
+    plot_type='interactive'
+else:
+    plot_type='static'
+results = {}
+table_counter = 1
+figure_counter = 1
+
+notebook_metadata["input_parameters"]["rnaseq_data_filename"] = rnaseq_data_filename
+notebook_metadata["input_parameters"]["meta_data_filename"] = meta_data_filename
+notebook_metadata["input_parameters"]["meta_class_column_name"] = meta_class_column_name
+notebook_metadata["input_parameters"]["control_name"] = control_name
+notebook_metadata["input_parameters"]["filter_genes"] = filter_genes
+notebook_metadata["input_parameters"]["low_expression_threshold"] = low_expression_threshold
+notebook_metadata["input_parameters"]["logCPM_normalization"] = True
+notebook_metadata["input_parameters"]["log_normalization"] = False
+notebook_metadata["input_parameters"]["z_normalization"] = True
+notebook_metadata["input_parameters"]["q_normalization"] = False
+notebook_metadata["input_parameters"]["visualization_method"] = "PCA"
+notebook_metadata["input_parameters"]["nr_genes"] = nr_genes
+notebook_metadata["input_parameters"]["gene_list_for_clustergrammer"] = gene_list_for_clustergrammer
+notebook_metadata["input_parameters"]["clustering_topk"] = clustering_topk
+notebook_metadata["input_parameters"]["diff_gex_method"] = diff_gex_method
+notebook_metadata["input_parameters"]["diff_gex_plot_method"] = diff_gex_plot_method
+notebook_metadata["input_parameters"]["pvalue_threshold"] = pvalue_threshold
+notebook_metadata["input_parameters"]["logfc_threshold"] = logfc_threshold
+notebook_metadata["input_parameters"]["gene_topk"] = gene_topk
+notebook_metadata["input_parameters"]["enrichr_libraries"] = enrichr_libraries
+notebook_metadata["input_parameters"]["nr_genesets"] = nr_genesets
+notebook_metadata["input_parameters"]["small_molecule_method"] = small_molecule_method
+notebook_metadata["input_parameters"]["l1000_topk"] = l1000_topk
+notebook_metadata["input_parameters"]["nr_drugs"] = nr_drugs
+
+
+
+#LOAD DATA
+try:
+    check_files(rnaseq_data_filename)
+except:
+    print("Error! Please load an RNA-seq expression file in txt, tsv or csv format")
+    pass
+try:    
+    check_files(meta_data_filename)
+except:
+    print("Error! Please load a metadata file in txt, tsv or csv format")
+    pass
+if rnaseq_data_filename.endswith(".csv"):
+    expr_df = pd.read_csv(rnaseq_data_filename, index_col=0).sort_index()
+else:
+    expr_df = pd.read_csv(rnaseq_data_filename, index_col=0, sep="\t").sort_index()
+if meta_data_filename.endswith(".csv"):
+    meta_df = pd.read_csv(meta_data_filename, index_col=0, dtype=str)
+else:
+    meta_df = pd.read_csv(meta_data_filename, sep="\t", index_col=0, dtype=str)
+meta_df.index = meta_df.index.map(str)
+# Match samples between the metadata and the datasets
+try:
+    check_df(meta_df, meta_class_column_name)
+except:
+    print(f"Error! Column '{meta_class_column_name}' is not in metadata")
+meta_df = meta_df[meta_df.index.isin(expr_df.columns)]
+# sort metadata by class labels; control first
+classes = list(meta_df[meta_class_column_name].unique())
+classes.remove(control_name)
+classes.insert(0, control_name)
+meta_df['tmp_class'] = pd.Categorical(meta_df[meta_class_column_name], classes)
+meta_df = meta_df.sort_values('tmp_class')
+meta_df = meta_df.drop('tmp_class', axis=1)
+expr_df = expr_df.loc[:,meta_df.index]
+expr_df = expr_df.groupby(expr_df.index).sum()
+try:
+    assert(meta_df.shape[0]==expr_df.shape[1])
+except:
+    print("Error! Input files are in a wrong format. \
+    Please check if the index of the expression data are genes and the columns are sample IDs. \
+    Sample IDs in the expression data and the metadata should be matched")
+dataset = dict()
+current_dataset = 'rawdata'
+dataset[current_dataset] = expr_df
+
+
+
+#Now remove lowly expressed genes
+
+## Filter out non-expressed genes
+expr_df = expr_df.loc[expr_df.sum(axis=1) > 0, :]
+## Filter out lowly expressed genes
+mask_low_vals = (expr_df > low_expression_threshold).sum(axis=1) > 2
+expr_df = expr_df.loc[mask_low_vals, :]
+current_dataset += '+filter_genes'
+dataset[current_dataset] = expr_df
+
+dataset['dataset_metadata'] = meta_df
+
+table_counter, notebook_metadata = display_object(table_counter, "Raw RNA-seq expression data. The table displays the first 5 rows of the quantified RNA-seq expression dataset. Rows represent genes, columns represent samples, and values show the number of mapped reads.", notebook_metadata, "raw_exp.csv", dataset[current_dataset].head(), istable=True)
+table_counter, notebook_metadata = display_object(table_counter, "Metadata. The table displays the metadata associated with the samples in the RNA-seq dataset. Rows represent RNA-seq samples, columns represent metadata categories.", notebook_metadata, "metadata.csv", dataset['dataset_metadata'].head(), istable=True)
+table_counter, notebook_metadata = display_object(table_counter, "Sample size for each class. The table displays the number of samples in each class.", notebook_metadata, "num_of_samples_in_class.csv", dataset['dataset_metadata'].reset_index().groupby(meta_class_column_name).count(), istable=True)
+
+dataset, normalization = normalize(dataset, current_dataset, True, False, True, False)
+table_counter, notebook_metadata = display_object(table_counter,"Normalized data. The table displays the expression values after normalization.",  notebook_metadata, "normalized_exp.csv", dataset[normalization].head(), istable=True)
+display(create_download_link(dataset[normalization], filename="normalized_exp.csv"))
+
+
+
+#VISUALIZE DATA
+
+method = "PCA"
+# Run analysis
+results[method] = run_dimension_reduction(dataset=dataset, method=method,\
+                         nr_genes=nr_genes, normalization=normalization, plot_type=plot_type)
+# Display results
+plot_name = "{}_plot_of_samples.png".format(method)
+figure_counter, notebook_metadata = plot_samples(results[method], meta_class_column_name=meta_class_column_name, counter=figure_counter, plot_name=plot_name, notebook_metadata=notebook_metadata, plot_type=plot_type)
+
+
+# Run analysis
+results['clustergrammer'] = run_clustergrammer(dataset=dataset, meta_class_column_name=meta_class_column_name, nr_genes=clustering_topk, normalization=normalization, z_score=True, gene_list=gene_list_for_clustergrammer)
+
+# Display results
+plot_clustergrammar(results['clustergrammer'])
+caption = "Clustered heatmap plot. The figure contains an interactive heatmap displaying gene expression for each sample in the RNA-seq dataset. Every row of the heatmap represents a gene, every column represents a sample, and every cell displays normalized gene expression values. The heatmap additionally features color bars beside each column which represent prior knowledge of each sample, such as the tissue of origin or experimental treatment."
+
+figure_counter, notebook_metadata = display_object(figure_counter, caption, notebook_metadata, saved_filename=results['clustergrammer'], istable=False)
+
+
+
+
+#DIFFERENTIAL GENE EXPRESSION
+
+signatures = get_signatures(classes, dataset, normalization, diff_gex_method, meta_class_column_name, filter_genes)
+
+for label, signature in signatures.items():
+    case_label = label.split(" vs. ")[1]
+    table_counter, notebook_metadata = display_object(table_counter, "Differentially expressed genes between {} using {}. The figure displays a browsable table containing the gene expression signature generated from a differential gene expression analysis. Every row of the table represents a gene; the columns display the estimated measures of differential expression.".format(label, diff_gex_method), notebook_metadata, "DEG_results_{}.csv".format(label), signature, istable=True)
+    display(create_download_link(signature, filename="DEG_results_{}.csv".format(label)))
+
+results['volcano_plot'] = {}
+# Loop through signatures
+for label, signature in signatures.items():
+    results['volcano_plot'][label] = run_volcano(signature, label, dataset, pvalue_threshold, logfc_threshold, plot_type)
+    plot_name = plot_volcano(results['volcano_plot'][label])
+    figure_counter, notebook_metadata = display_object(figure_counter, "Volcano plot for {}. The figure contains an interactive scatter plot which displays the log2-fold changes and statistical significance of each gene calculated by performing a differential gene expression analysis. Genes with logFC > {} and p-value < {} in red and genes with logFC < -{} and p-value < {} in blue. Additional information for each gene is available by hovering over it.".format(label, logfc_threshold, pvalue_threshold, logfc_threshold, pvalue_threshold), notebook_metadata, plot_name, istable=False)
+
+
+
+#ENRICHR
+
+# Loop through signatures
+results = {}
+results['enrichr']= {}
+if diff_gex_method == "characteristic_direction":
+    fc_colname = "CD-coefficient"
+    sort_genes_by = "CD-coefficient"
+    ascending = False
+elif diff_gex_method == "limma":
+    fc_colname = "logFC"
+    sort_genes_by = "t"
+    ascending = False
+elif diff_gex_method == "edgeR":
+    fc_colname = "logFC"
+    sort_genes_by = "PValue"
+    ascending = True
+elif diff_gex_method == "DESeq2":
+    fc_colname = "log2FoldChange"
+    sort_genes_by = "padj"
+    ascending = True
+enrichr_link_dict = dict()
+for label, signature in signatures.items():    
+    case_label = label.split(" vs. ")[1]
+    # Run analysis
+    results['enrichr'][label] = run_enrichr(signature=signature, signature_label=label, fc_colname=fc_colname,geneset_size=gene_topk, sort_genes_by = sort_genes_by,ascending=ascending)
+    tmp_enrichr_link_dict = dict()
+    title_up = f"Enrichment Analysis Result: {label} (up-regulated in {case_label})"  
+    title_down = f"Enrichment Analysis Result: {label} (down-regulated in {case_label})"  
+    enrichr_link_dict[title_up] = dict()
+    enrichr_link_dict[title_up]["link"] = "<a href=https://maayanlab.cloud/Enrichr/enrich?dataset={} target=\"_blank\">link to Enrichr</a>".format(results['enrichr'][label]["upregulated"]["shortId"])
+    enrichr_link_dict[title_down] = dict()
+    enrichr_link_dict[title_down]["link"] = "<a href=https://maayanlab.cloud/Enrichr/enrich?dataset={} target=\"_blank\">link to Enrichr</a>".format(results['enrichr'][label]["downregulated"]["shortId"])
+
+enrichr_link_df = pd.DataFrame.from_dict(enrichr_link_dict).T
+table_counter, notebook_metadata = display_object(table_counter, "The table displays links to Enrichr containing the results of enrichment analyses generated by analyzing the up-regulated and down-regulated genes from a differential expression analysis. By clicking on these links, users can interactively explore and download the enrichment results from the Enrichr website.", notebook_metadata=notebook_metadata, saved_filename="enrichr_links.csv", df=enrichr_link_df, ishtml=True)
+
+
+
+
+#GENE ONTOLOGY
+
+results['go_enrichment'] = {}
+for label, signature in signatures.items():
+    # Run analysis
+    results['go_enrichment'][label] = get_enrichr_results_by_library(results['enrichr'][label], label, library_type='go', version='2018')
+for label, signature in signatures.items():
+    # Create dataframe
+    enrichment_results = results['go_enrichment'][label]
+    enrichment_dataframe = pd.concat([enrichment_results['upregulated'], enrichment_results['downregulated']])
+    # Plot barcharts
+    libraries = enrichment_dataframe['gene_set_library'].unique()   
+    for gene_set_library in libraries:
+        plot_name = "{}_barchart_{}.png".format(gene_set_library, label)
+        plot_library_barchart(enrichment_results, gene_set_library, enrichment_results['signature_label'], enrichment_results['sort_results_by'], nr_genesets=nr_genesets, plot_type=plot_type, plot_name=plot_name) # 10 300
+        figure_counter, notebook_metadata = display_object(figure_counter, "Enrichment Analysis Results for {} in Gene Onotology ({}). The figure contains interactive bar charts displaying the results of the Gene Ontology enrichment analysis generated using Enrichr. The x axis indicates the -log10(P-value) for each term. Significant terms are highlighted in bold. Additional information about enrichment results is available by hovering over each bar.".format(label, gene_set_library), notebook_metadata, saved_filename=plot_name, istable=False)
+
+# Initialize results
+results['pathway_enrichment'] = {}
+# Loop through results
+for label, enrichr_results in results['enrichr'].items():
+    # Run analysis
+    results['pathway_enrichment'][label] = get_enrichr_results_by_library(enrichr_results=enrichr_results, signature_label=label, plot_type=plot_type, library_type='pathway', sort_results_by='pvalue')
+for label, signature in signatures.items():
+    # Create dataframe
+    enrichment_results = results['pathway_enrichment'][label]
+    enrichment_dataframe = pd.concat([enrichment_results['upregulated'], enrichment_results['downregulated']])
+    # Plot barcharts
+    libraries = enrichment_dataframe['gene_set_library'].unique()   
+    for gene_set_library in libraries:
+        # Display results
+        plot_name = "{}_barchart_{}.png".format(gene_set_library, label)
+        plot_library_barchart(enrichment_results, gene_set_library, enrichment_results['signature_label'], enrichment_results['sort_results_by'], nr_genesets=nr_genesets, plot_type=plot_type)
+        figure_counter, notebook_metadata = display_object(figure_counter, "Enrichment Analysis Results for {} in {}. The figure contains interactive bar charts displaying the results of the pathway enrichment analysis generated using Enrichr. The x axis indicates the -log10(P-value) for each term. Significant terms are highlighted in bold. Additional information about enrichment results is available by hovering over each bar.".format(label, gene_set_library), notebook_metadata, saved_filename=plot_name, istable=False)
